@@ -7,6 +7,7 @@
   - AForge.Video
   - AForge.Video.DirectShow
   - ZXing.Net
+
 需要：ffmpeg（要自己搭好环境哦）
 
 用法：
