@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Drawing;
 using System.Drawing.Imaging;
@@ -11,6 +11,7 @@ using AForge.Video.DirectShow;
 using ZXing;
 using System.Diagnostics;
 using ZXing.Common;
+using System.Xml.Serialization;
 
 namespace ExpressRecorder
 {
@@ -46,6 +47,19 @@ namespace ExpressRecorder
         private ComboBox encoderComboBox;
         private Dictionary<string, string> availableEncoders;
 
+        // 新增：预览缩放和拖动相关变量
+        private float zoomFactor = 1.0f;
+        private Point dragStart;
+        private Point offset = Point.Empty;
+        private bool isDragging = false;
+        private Button resetViewButton;
+
+        // 新增：录制分辨率选择
+        private ComboBox recordResolutionComboBox;
+
+        // 新增：配置类
+        private AppConfig appConfig = new AppConfig();
+
         // 快递公司正则表达式规则
         private readonly Dictionary<string, string> expressRules = new Dictionary<string, string>
         {
@@ -62,8 +76,11 @@ namespace ExpressRecorder
 
         public MainForm()
         {
+            // 加载配置
+            LoadConfig();
+
             // 设置默认保存路径为exe文件旁的Videos文件夹
-            saveDirectory = Path.Combine(Application.StartupPath, "Videos");
+            saveDirectory = appConfig.SaveDirectory ?? Path.Combine(Application.StartupPath, "Videos");
             if (!Directory.Exists(saveDirectory))
             {
                 Directory.CreateDirectory(saveDirectory);
@@ -84,12 +101,18 @@ namespace ExpressRecorder
             cameraComboBox = new ComboBox { Location = new Point(120, 20), Size = new Size(200, 20), DropDownStyle = ComboBoxStyle.DropDownList };
 
             // 分辨率选择
-            Label resolutionLabel = new Label { Text = "分辨率:", Location = new Point(20, 50), Size = new Size(100, 20) };
+            Label resolutionLabel = new Label { Text = "摄像头分辨率:", Location = new Point(20, 50), Size = new Size(100, 20) };
             resolutionComboBox = new ComboBox { Location = new Point(120, 50), Size = new Size(100, 20), DropDownStyle = ComboBoxStyle.DropDownList };
 
+            // 录制分辨率选择
+            Label recordResolutionLabel = new Label { Text = "录制分辨率:", Location = new Point(230, 50), Size = new Size(80, 20) };
+            recordResolutionComboBox = new ComboBox { Location = new Point(310, 50), Size = new Size(100, 20), DropDownStyle = ComboBoxStyle.DropDownList };
+            recordResolutionComboBox.Items.AddRange(new object[] { "640x360", "854x480", "1280x720", "1920x1080" });
+            recordResolutionComboBox.SelectedIndex = 2; // 默认720p
+
             // 帧率选择
-            Label fpsLabel = new Label { Text = "帧率:", Location = new Point(230, 50), Size = new Size(50, 20) };
-            fpsComboBox = new ComboBox { Location = new Point(280, 50), Size = new Size(60, 20), DropDownStyle = ComboBoxStyle.DropDownList };
+            Label fpsLabel = new Label { Text = "帧率:", Location = new Point(420, 50), Size = new Size(50, 20) };
+            fpsComboBox = new ComboBox { Location = new Point(470, 50), Size = new Size(60, 20), DropDownStyle = ComboBoxStyle.DropDownList };
 
             // 快递单号输入
             Label expressLabel = new Label { Text = "快递单号:", Location = new Point(20, 80), Size = new Size(100, 20) };
@@ -113,22 +136,29 @@ namespace ExpressRecorder
             stopButton = new Button { Text = "停止录制", Location = new Point(110, 170), Size = new Size(80, 30), Enabled = false };
             Button previewButton = new Button { Text = "开启预览", Location = new Point(200, 170), Size = new Size(80, 30) };
             Button closePreviewButton = new Button { Text = "关闭预览", Location = new Point(290, 170), Size = new Size(80, 30), Enabled = false };
+            resetViewButton = new Button { Text = "复位视图", Location = new Point(380, 170), Size = new Size(80, 30) };
 
-            // 视频显示区域
+            // 视频显示区域 - 保持16:9比例
             videoBox = new PictureBox
             {
                 Location = new Point(20, 210),
-                Size = new Size(640, 480),
+                Size = new Size(640, 360), // 16:9比例
                 BorderStyle = BorderStyle.FixedSingle,
                 BackColor = Color.Black,
                 SizeMode = PictureBoxSizeMode.Zoom
             };
 
+            // 添加鼠标事件处理
+            videoBox.MouseWheel += VideoBox_MouseWheel;
+            videoBox.MouseDown += VideoBox_MouseDown;
+            videoBox.MouseMove += VideoBox_MouseMove;
+            videoBox.MouseUp += VideoBox_MouseUp;
+
             // 添加控件到窗体
             this.Controls.AddRange(new Control[] { cameraLabel, cameraComboBox, resolutionLabel, resolutionComboBox,
-                fpsLabel, fpsComboBox, expressLabel, expressTextBox, companyLabel, companyComboBox,
-                encoderLabel, encoderComboBox, savePathLabel, savePathTextBox, browseButton,
-                startButton, stopButton, previewButton, closePreviewButton, videoBox });
+                recordResolutionLabel, recordResolutionComboBox, fpsLabel, fpsComboBox, expressLabel, expressTextBox,
+                companyLabel, companyComboBox, encoderLabel, encoderComboBox, savePathLabel, savePathTextBox, browseButton,
+                startButton, stopButton, previewButton, closePreviewButton, resetViewButton, videoBox });
 
             // 初始化编码器列表
             InitializeEncoders();
@@ -143,8 +173,17 @@ namespace ExpressRecorder
                     {
                         saveDirectory = folderDialog.SelectedPath;
                         savePathTextBox.Text = saveDirectory;
+                        appConfig.SaveDirectory = saveDirectory;
                     }
                 }
+            };
+
+            // 复位视图按钮事件
+            resetViewButton.Click += (s, e) =>
+            {
+                zoomFactor = 1.0f;
+                offset = Point.Empty;
+                videoBox.Invalidate(); // 刷新显示
             };
 
             // 填充快递公司下拉框
@@ -164,12 +203,13 @@ namespace ExpressRecorder
             // 设置摄像头选择事件
             cameraComboBox.SelectedIndexChanged += CameraComboBox_SelectedIndexChanged;
 
+            // 应用保存的配置
+            ApplySavedConfig();
+
             // 如果有摄像头设备，选择第一个并初始化分辨率
-            if (cameraComboBox.Items.Count > 0)
+            if (cameraComboBox.Items.Count > 0 && cameraComboBox.SelectedIndex < 0)
             {
                 cameraComboBox.SelectedIndex = 0;
-                // 手动调用事件处理程序，初始化分辨率和帧率
-                CameraComboBox_SelectedIndexChanged(cameraComboBox, EventArgs.Empty);
             }
 
             // 预览按钮事件
@@ -241,6 +281,168 @@ namespace ExpressRecorder
             displayTimer = new System.Windows.Forms.Timer { Interval = 40 };
             displayTimer.Tick += DisplayTimer_Tick;
             displayTimer.Start();
+
+            // 窗体关闭事件
+            this.FormClosing += MainForm_FormClosing;
+        }
+
+        // 新增：加载配置
+        private void LoadConfig()
+        {
+            string configPath = Path.Combine(Application.StartupPath, "config.xml");
+            if (File.Exists(configPath))
+            {
+                try
+                {
+                    XmlSerializer serializer = new XmlSerializer(typeof(AppConfig));
+                    using (FileStream fs = new FileStream(configPath, FileMode.Open))
+                    {
+                        appConfig = (AppConfig)serializer.Deserialize(fs);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"加载配置失败: {ex.Message}");
+                    appConfig = new AppConfig();
+                }
+            }
+        }
+
+        // 新增：保存配置
+        private void SaveConfig()
+        {
+            try
+            {
+                // 更新当前配置
+                appConfig.CameraDevice = cameraComboBox.SelectedIndex;
+                appConfig.CameraResolution = resolutionComboBox.SelectedIndex;
+                appConfig.RecordResolution = recordResolutionComboBox.SelectedIndex;
+                appConfig.FrameRate = fpsComboBox.SelectedIndex;
+                appConfig.Encoder = encoderComboBox.SelectedIndex;
+                appConfig.ExpressCompany = companyComboBox.SelectedIndex;
+                appConfig.SaveDirectory = saveDirectory;
+
+                string configPath = Path.Combine(Application.StartupPath, "config.xml");
+                XmlSerializer serializer = new XmlSerializer(typeof(AppConfig));
+                using (FileStream fs = new FileStream(configPath, FileMode.Create))
+                {
+                    serializer.Serialize(fs, appConfig);
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"保存配置失败: {ex.Message}");
+            }
+        }
+
+        // 新增：应用保存的配置
+        private void ApplySavedConfig()
+        {
+            if (appConfig.CameraDevice >= 0 && appConfig.CameraDevice < cameraComboBox.Items.Count)
+                cameraComboBox.SelectedIndex = appConfig.CameraDevice;
+
+            if (appConfig.RecordResolution >= 0 && appConfig.RecordResolution < recordResolutionComboBox.Items.Count)
+                recordResolutionComboBox.SelectedIndex = appConfig.RecordResolution;
+
+            if (appConfig.Encoder >= 0 && appConfig.Encoder < encoderComboBox.Items.Count)
+                encoderComboBox.SelectedIndex = appConfig.Encoder;
+
+            if (appConfig.ExpressCompany >= 0 && appConfig.ExpressCompany < companyComboBox.Items.Count)
+                companyComboBox.SelectedIndex = appConfig.ExpressCompany;
+
+            if (!string.IsNullOrEmpty(appConfig.SaveDirectory))
+            {
+                saveDirectory = appConfig.SaveDirectory;
+                savePathTextBox.Text = saveDirectory;
+            }
+        }
+
+        // 新增：鼠标滚轮事件 - 缩放
+        private void VideoBox_MouseWheel(object sender, MouseEventArgs e)
+        {
+            if (lastFrame == null) return;
+
+            float oldZoom = zoomFactor;
+
+            // 计算缩放比例
+            if (e.Delta > 0)
+                zoomFactor *= 1.1f;
+            else
+                zoomFactor /= 1.1f;
+
+            // 限制缩放范围
+            zoomFactor = Math.Max(0.5f, Math.Min(zoomFactor, 5.0f));
+
+            // 调整偏移量，使缩放中心保持在鼠标位置
+            if (lastFrame != null)
+            {
+                PointF mousePosBeforeZoom = new PointF(
+                    (e.X - videoBox.Width / 2) / oldZoom + offset.X,
+                    (e.Y - videoBox.Height / 2) / oldZoom + offset.Y);
+
+                offset.X = (int)(mousePosBeforeZoom.X - (e.X - videoBox.Width / 2) / zoomFactor);
+                offset.Y = (int)(mousePosBeforeZoom.Y - (e.Y - videoBox.Height / 2) / zoomFactor);
+
+                // 限制偏移范围，防止出现黑边
+                LimitOffset();
+            }
+        }
+
+        // 新增：鼠标按下事件 - 开始拖动
+        private void VideoBox_MouseDown(object sender, MouseEventArgs e)
+        {
+            if (e.Button == MouseButtons.Left && lastFrame != null)
+            {
+                isDragging = true;
+                dragStart = e.Location;
+            }
+        }
+
+        // 新增：鼠标移动事件 - 拖动
+        private void VideoBox_MouseMove(object sender, MouseEventArgs e)
+        {
+            if (isDragging && lastFrame != null)
+            {
+                // 修复拖动方向问题
+                offset.X -= (int)((e.X - dragStart.X) / zoomFactor);
+                offset.Y -= (int)((e.Y - dragStart.Y) / zoomFactor);
+
+                dragStart = e.Location;
+
+                // 限制偏移范围，防止出现黑边
+                LimitOffset();
+            }
+        }
+
+        // 新增：鼠标释放事件 - 结束拖动
+        private void VideoBox_MouseUp(object sender, MouseEventArgs e)
+        {
+            if (e.Button == MouseButtons.Left)
+            {
+                isDragging = false;
+            }
+        }
+
+        // 新增：限制偏移范围，防止出现黑边
+        private void LimitOffset()
+        {
+            if (lastFrame == null) return;
+
+            // 使用锁确保线程安全
+            lock (frameLock)
+            {
+                int maxOffsetX = (int)((lastFrame.Width - lastFrame.Width / zoomFactor) / 2);
+                int maxOffsetY = (int)((lastFrame.Height - lastFrame.Height / zoomFactor) / 2);
+
+                offset.X = Math.Max(-maxOffsetX, Math.Min(offset.X, maxOffsetX));
+                offset.Y = Math.Max(-maxOffsetY, Math.Min(offset.Y, maxOffsetY));
+            }
+        }
+
+        // 新增：窗体关闭事件
+        private void MainForm_FormClosing(object sender, FormClosingEventArgs e)
+        {
+            SaveConfig();
         }
 
         // 摄像头选择事件处理程序
@@ -264,9 +466,12 @@ namespace ExpressRecorder
                 }
 
                 if (resolutionComboBox.Items.Count > 0)
-                    resolutionComboBox.SelectedIndex = 0;
+                    resolutionComboBox.SelectedIndex = appConfig.CameraResolution >= 0 ?
+                        Math.Min(appConfig.CameraResolution, resolutionComboBox.Items.Count - 1) : 0;
+
                 if (fpsComboBox.Items.Count > 0)
-                    fpsComboBox.SelectedIndex = 0;
+                    fpsComboBox.SelectedIndex = appConfig.FrameRate >= 0 ?
+                        Math.Min(appConfig.FrameRate, fpsComboBox.Items.Count - 1) : 0;
             }
         }
 
@@ -316,7 +521,8 @@ namespace ExpressRecorder
 
             // 默认选择第一个可用的编码器
             if (encoderComboBox.Items.Count > 0)
-                encoderComboBox.SelectedIndex = 0;
+                encoderComboBox.SelectedIndex = appConfig.Encoder >= 0 ?
+                    Math.Min(appConfig.Encoder, encoderComboBox.Items.Count - 1) : 0;
         }
 
         private void VideoSource_NewFrame(object sender, NewFrameEventArgs eventArgs)
@@ -340,7 +546,7 @@ namespace ExpressRecorder
                 // 条形码识别 - 只在未录制时进行
                 if (!isRecording && !isProcessingBarcode && (DateTime.Now - lastBarcodeTime).TotalSeconds > 2)
                 {
-                    // 使用优化的条码识别设置，专注于快递单号格式
+                    // 使用优化的条码识别设置，提高识别率和旋转支持
                     BarcodeReader reader = new BarcodeReader
                     {
                         Options = new DecodingOptions
@@ -349,16 +555,25 @@ namespace ExpressRecorder
                             {
                                 BarcodeFormat.CODE_128, // 快递单号最常用的格式
                                 BarcodeFormat.CODE_39,
-                                BarcodeFormat.QR_CODE
+                                BarcodeFormat.QR_CODE,
+                                BarcodeFormat.EAN_13,
+                                BarcodeFormat.EAN_8,
+                                BarcodeFormat.UPC_A,
+                                BarcodeFormat.UPC_E
                             },
-                            TryHarder = false, // 设置为false以减少误识别
-                            PureBarcode = true, // 设置为true以专注于纯条码
-                            TryInverted = false // 不尝试识别反转的条码
+                            TryHarder = true, // 设置为true以提高识别率
+                            PureBarcode = false, // 设置为false以支持复杂背景
+                            TryInverted = true, // 尝试识别反转的条码
+                            CharacterSet = "UTF-8"
                         },
-                        AutoRotate = false // 禁用自动旋转以减少误识别
+                        AutoRotate = true, // 启用自动旋转
+                        TryInverted = true // 尝试识别反转的条码
                     };
 
-                    Result result = reader.Decode(lastFrame);
+                    // 只扫描预览区域内的内容
+                    Bitmap scanArea = GetPreviewArea(lastFrame);
+                    Result result = reader.Decode(scanArea);
+                    scanArea.Dispose();
 
                     if (result != null && !string.IsNullOrEmpty(result.Text))
                     {
@@ -404,8 +619,16 @@ namespace ExpressRecorder
                 {
                     try
                     {
+                        // 获取原始帧并裁剪到16:9
+                        Bitmap croppedFrame = CropTo16_9(lastFrame);
+
+                        // 调整到录制分辨率
+                        string[] recordRes = recordResolutionComboBox.SelectedItem.ToString().Split('x');
+                        Size recordSize = new Size(int.Parse(recordRes[0]), int.Parse(recordRes[1]));
+                        Bitmap resizedFrame = ResizeImage(croppedFrame, recordSize);
+
                         // 创建带水印的帧
-                        Bitmap watermarkedFrame = AddWatermarkToFrame((Bitmap)lastFrame.Clone());
+                        Bitmap watermarkedFrame = AddWatermarkToFrame(resizedFrame);
 
                         // 将Bitmap转换为字节数组
                         BitmapData data = watermarkedFrame.LockBits(
@@ -420,6 +643,8 @@ namespace ExpressRecorder
                         // 写入FFmpeg
                         ffmpegWriter.Write(buffer);
 
+                        croppedFrame.Dispose();
+                        resizedFrame.Dispose();
                         watermarkedFrame.Dispose();
                     }
                     catch (Exception ex)
@@ -432,6 +657,98 @@ namespace ExpressRecorder
             {
                 Console.WriteLine($"处理新帧时出错: {ex.Message}");
             }
+        }
+
+        // 新增：将图像裁剪到16:9比例
+        private Bitmap CropTo16_9(Bitmap source)
+        {
+            int sourceWidth = source.Width;
+            int sourceHeight = source.Height;
+            
+            // 计算16:9的目标尺寸
+            int targetWidth, targetHeight;
+            
+            // 根据原始比例决定是裁剪宽度还是高度
+            if ((float)sourceWidth / sourceHeight > 16.0f / 9.0f)
+            {
+                // 原始画面太宽，裁剪宽度
+                targetHeight = sourceHeight;
+                targetWidth = (int)(targetHeight * 16.0 / 9.0);
+            }
+            else
+            {
+                // 原始画面太高，裁剪高度
+                targetWidth = sourceWidth;
+                targetHeight = (int)(targetWidth * 9.0 / 16.0);
+            }
+            
+            // 计算裁剪区域（居中裁剪）
+            int x = (sourceWidth - targetWidth) / 2;
+            int y = (sourceHeight - targetHeight) / 2;
+            
+            // 确保不超出边界
+            x = Math.Max(0, x);
+            y = Math.Max(0, y);
+            targetWidth = Math.Min(targetWidth, sourceWidth - x);
+            targetHeight = Math.Min(targetHeight, sourceHeight - y);
+            
+            // 创建目标位图并裁剪
+            Bitmap target = new Bitmap(targetWidth, targetHeight);
+            using (Graphics g = Graphics.FromImage(target))
+            {
+                g.DrawImage(source, new Rectangle(0, 0, targetWidth, targetHeight),
+                            new Rectangle(x, y, targetWidth, targetHeight), GraphicsUnit.Pixel);
+            }
+            
+            return target;
+        }
+
+        // 新增：获取预览区域（考虑缩放和偏移）
+        private Bitmap GetPreviewArea(Bitmap sourceFrame)
+        {
+            if (zoomFactor == 1.0f && offset.IsEmpty)
+                return (Bitmap)sourceFrame.Clone();
+
+            // 使用锁确保线程安全
+            lock (frameLock)
+            {
+                // 计算预览区域
+                int previewWidth = (int)(sourceFrame.Width / zoomFactor);
+                int previewHeight = (int)(sourceFrame.Height / zoomFactor);
+
+                int x = (sourceFrame.Width - previewWidth) / 2 + offset.X;
+                int y = (sourceFrame.Height - previewHeight) / 2 + offset.Y;
+
+                // 确保不超出边界
+                x = Math.Max(0, Math.Min(x, sourceFrame.Width - previewWidth));
+                y = Math.Max(0, Math.Min(y, sourceFrame.Height - previewHeight));
+
+                // 裁剪图像
+                Rectangle cropRect = new Rectangle(x, y, previewWidth, previewHeight);
+                Bitmap target = new Bitmap(cropRect.Width, cropRect.Height);
+
+                using (Graphics g = Graphics.FromImage(target))
+                {
+                    g.DrawImage(sourceFrame, new Rectangle(0, 0, target.Width, target.Height),
+                                cropRect, GraphicsUnit.Pixel);
+                }
+
+                return target;
+            }
+        }
+
+        // 新增：调整图像大小
+        private Bitmap ResizeImage(Bitmap source, Size newSize)
+        {
+            Bitmap result = new Bitmap(newSize.Width, newSize.Height);
+
+            using (Graphics g = Graphics.FromImage(result))
+            {
+                g.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.HighQualityBicubic;
+                g.DrawImage(source, 0, 0, newSize.Width, newSize.Height);
+            }
+
+            return result;
         }
 
         // 判断是否可能是快递单号
@@ -507,12 +824,15 @@ namespace ExpressRecorder
                 {
                     using (currentFrame)
                     {
+                        // 应用缩放和偏移
+                        Bitmap transformedFrame = ApplyZoomAndOffset(currentFrame);
+
                         // 缩放图像以适应预览框
-                        Bitmap scaledFrame = ScaleImage(currentFrame, videoBox.Width, videoBox.Height);
+                        Bitmap scaledFrame = ScaleImage(transformedFrame, videoBox.Width, videoBox.Height);
 
                         using (Graphics g = Graphics.FromImage(scaledFrame))
                         {
-                            // 添加时间戳和录制时长
+                            // 添加时间戳和录制时长 - 固定位置，不随缩放移动
                             string currentTime = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss");
                             string recordingTime = isRecording ?
                                 (DateTime.Now - recordingStartTime).ToString(@"hh\:mm\:ss") : "00:00:00";
@@ -535,8 +855,8 @@ namespace ExpressRecorder
                             if (!isRecording && lastBarcodeResult != null)
                             {
                                 // 计算缩放比例
-                                float scaleX = (float)scaledFrame.Width / currentFrame.Width;
-                                float scaleY = (float)scaledFrame.Height / currentFrame.Height;
+                                float scaleX = (float)scaledFrame.Width / transformedFrame.Width;
+                                float scaleY = (float)scaledFrame.Height / transformedFrame.Height;
 
                                 // 绘制绿色矩形框
                                 var points = lastBarcodeResult.ResultPoints;
@@ -584,6 +904,8 @@ namespace ExpressRecorder
                             videoBox.Image = scaledFrame;
                             oldImage?.Dispose();
                         }
+
+                        transformedFrame.Dispose();
                     }
                 }
             }
@@ -593,20 +915,55 @@ namespace ExpressRecorder
             }
         }
 
+        // 新增：应用缩放和偏移
+        private Bitmap ApplyZoomAndOffset(Bitmap source)
+        {
+            if (zoomFactor == 1.0f && offset.IsEmpty)
+                return (Bitmap)source.Clone();
+
+            // 计算预览区域
+            int previewWidth = (int)(source.Width / zoomFactor);
+            int previewHeight = (int)(source.Height / zoomFactor);
+
+            int x = (source.Width - previewWidth) / 2 + offset.X;
+            int y = (source.Height - previewHeight) / 2 + offset.Y;
+
+            // 确保不超出边界
+            x = Math.Max(0, Math.Min(x, source.Width - previewWidth));
+            y = Math.Max(0, Math.Min(y, source.Height - previewHeight));
+
+            // 裁剪图像
+            Rectangle cropRect = new Rectangle(x, y, previewWidth, previewHeight);
+            Bitmap target = new Bitmap(cropRect.Width, cropRect.Height);
+
+            using (Graphics g = Graphics.FromImage(target))
+            {
+                g.DrawImage(source, new Rectangle(0, 0, target.Width, target.Height),
+                            cropRect, GraphicsUnit.Pixel);
+            }
+
+            return target;
+        }
+
         // 缩放图像以适应指定大小
         private Bitmap ScaleImage(Bitmap image, int maxWidth, int maxHeight)
         {
-            var ratioX = (double)maxWidth / image.Width;
-            var ratioY = (double)maxHeight / image.Height;
-            var ratio = Math.Min(ratioX, ratioY);
+            // 计算保持比例的缩放
+            double ratioX = (double)maxWidth / image.Width;
+            double ratioY = (double)maxHeight / image.Height;
+            double ratio = Math.Min(ratioX, ratioY);
 
             var newWidth = (int)(image.Width * ratio);
             var newHeight = (int)(image.Height * ratio);
 
-            var newImage = new Bitmap(newWidth, newHeight);
+            // 创建居中显示的新图像
+            var newImage = new Bitmap(maxWidth, maxHeight);
             using (Graphics graphics = Graphics.FromImage(newImage))
             {
-                graphics.DrawImage(image, 0, 0, newWidth, newHeight);
+                graphics.Clear(Color.Black); // 填充黑色背景
+                int x = (maxWidth - newWidth) / 2;
+                int y = (maxHeight - newHeight) / 2;
+                graphics.DrawImage(image, x, y, newWidth, newHeight);
             }
 
             return newImage;
@@ -614,8 +971,8 @@ namespace ExpressRecorder
 
         private Brush GetContrastBrush(Bitmap frame)
         {
-            // 获取图像右下角区域的平均亮度
-            Rectangle sampleArea = new Rectangle(frame.Width - 100, frame.Height - 50, 50, 30);
+            // 获取图像左上角区域的平均亮度（水印位置）
+            Rectangle sampleArea = new Rectangle(10, 10, 50, 30);
             double brightness = 0;
             int count = 0;
 
@@ -670,12 +1027,13 @@ namespace ExpressRecorder
             string fileName = $"{DateTime.Now:yyyy-MM-dd}_{DateTime.Now:HH-mm-ss}_{code}_{company}.mp4";
             string fullPath = Path.Combine(saveDirectory, fileName);
 
-            // 使用摄像头相同的分辨率
-            Size frameSize = videoSource.VideoResolution.FrameSize;
+            // 使用选择的录制分辨率
+            string[] recordRes = recordResolutionComboBox.SelectedItem.ToString().Split('x');
+            Size recordSize = new Size(int.Parse(recordRes[0]), int.Parse(recordRes[1]));
             int frameRate = videoSource.VideoResolution.AverageFrameRate;
 
             // 启动FFmpeg进程进行录制
-            StartFFmpegRecording(fullPath, frameSize.Width, frameSize.Height, frameRate);
+            StartFFmpegRecording(fullPath, recordSize.Width, recordSize.Height, frameRate);
 
             recordingStartTime = DateTime.Now;
             isRecording = true;
@@ -811,6 +1169,19 @@ namespace ExpressRecorder
                 }
             }
         }
+    }
+
+    // 新增：配置类
+    [Serializable]
+    public class AppConfig
+    {
+        public int CameraDevice { get; set; } = -1;
+        public int CameraResolution { get; set; } = -1;
+        public int RecordResolution { get; set; } = -1;
+        public int FrameRate { get; set; } = -1;
+        public int Encoder { get; set; } = -1;
+        public int ExpressCompany { get; set; } = -1;
+        public string SaveDirectory { get; set; }
     }
 
     // 快递信息确认对话框
